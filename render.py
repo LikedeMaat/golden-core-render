@@ -314,9 +314,101 @@ def callback(job, payload):
         log('callback faalt', e)
 
 
+# ---------- job normaliseren (Make levert script_raw + plan) ----------
+BUST_PROMPT = ("Photographic close-up of an ancient white marble bust of the philosopher {name}, true to known portraits. "
+               "Three-quarter view. The face is clearly and fully lit by one warm golden key light from the front left, eyes and "
+               "features detailed and visible, soft falloff into deep shadow on the far side. Pure near-black background with lots "
+               "of empty dark space. Cinematic, premium, 85mm lens, shallow depth of field, subtle film grain, no text, no logo.")
+THUMB_PROMPT = ("Photographic portrait of an ancient dark marble bust of the philosopher {name}, true to known portraits, intense "
+                "calm gaze. Three-quarter view, bust placed on the left third of the frame. The whole face is clearly and brightly lit "
+                "by a strong warm golden key light from the front, eyes, nose and brow sharp and well visible, gentle rim light. "
+                "Near-black background, large empty dark space on the right two thirds for text. Premium, high contrast, 85mm lens, "
+                "subtle film grain, no text, no logo.")
+
+
+def normalize(job):
+    if 'script_raw' not in job:
+        return job
+    sr = job['script_raw']
+    if isinstance(sr, str):
+        sr = json.loads(sr)
+    sc = sr.get('script', sr)
+    fc = sr.get('factcheck') or {}
+    plan_ = job.get('plan') or {}
+    if isinstance(plan_, str):
+        plan_ = json.loads(plan_) if plan_.strip() else {}
+    job['script'] = {'paragraphs': sc['paragraphs'], 'closing_quote_lines': sc.get('closing_quote_lines', []),
+                     'fixes': fc.get('fixes', [])}
+    job['philosopher'] = plan_.get('philosopher') or sc.get('philosopher', '')
+    job['format'] = plan_.get('format') or job.get('format', 'Deep')
+    job['title'] = plan_.get('title') or sc.get('title')
+    job['thumb_text'] = plan_.get('thumb_text') or (sc.get('thumbnail') or {}).get('text_overlay', '')
+    job['code_scene'] = plan_.get('code_scene') or 'kern'
+    if plan_.get('quote'):
+        job['opening_quote'] = plan_['quote']
+    if plan_.get('closing_passage'):
+        job['closing_passage'] = plan_['closing_passage']
+    src = plan_.get('source', ''); tr = plan_.get('translation', '')
+    job['quote_source'] = plan_.get('source_line') or (f"{job['philosopher']}, {src}" + (f" (tr. {tr})" if tr else ''))
+    desc = ((sc.get('youtube') or {}).get('description') or '').strip()
+    if job.get('opening_quote'):
+        lines = desc.split('\n')
+        q = '"' + job['opening_quote'].strip().strip('"“”') + '"'
+        if lines and lines[0].startswith(('"', '“')):
+            lines[0] = q
+        else:
+            lines = [q, ''] + lines
+        desc = '\n'.join(lines)
+    job['description'] = desc
+    imgs = plan_.get('images') or {}
+    scenes = sc.get('scenes', [])
+    story = imgs.get('story') or [s['image_prompt'] for s in scenes if s.get('section') in ('story', 'acceptance')]
+    desk = imgs.get('desk') or [s['image_prompt'] for s in scenes if s.get('section') not in ('story', 'acceptance')]
+    if not story and desk:
+        story = desk[1:2]
+    nmax = 2 if job['format'] == 'Deep' else 1
+    job['image_prompts'] = {'bust': BUST_PROMPT.format(name=job['philosopher']),
+                            'thumb': THUMB_PROMPT.format(name=job['philosopher']),
+                            'story': story[:nmax], 'desk': desk[:nmax] or story[:1]}
+    return job
+
+
+def openai_image(prompt, path, quality='medium'):
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return path
+    body = {'model': 'gpt-image-2', 'prompt': prompt.replace('"', ''), 'size': '1536x1024', 'quality': quality, 'n': 1}
+    for i in range(4):
+        try:
+            st, data = http('https://api.openai.com/v1/images/generations', data=json.dumps(body).encode(),
+                            headers={'Authorization': 'Bearer ' + os.environ['OPENAI_KEY'], 'Content-Type': 'application/json'},
+                            method='POST', timeout=300)
+            open(path, 'wb').write(base64.b64decode(json.loads(data)['data'][0]['b64_json']))
+            return path
+        except Exception as e:
+            log('beeld mislukt', i, str(e)[:200]); time.sleep(10 * (i + 1))
+    raise RuntimeError('OpenAI-beeld faalt: ' + prompt[:60])
+
+
+def make_images(job, A):
+    ip = job['image_prompts']
+    tasks = [('bust', ip['bust'], 'medium'), ('thumb', ip['thumb'], 'high')]
+    tasks += [(f'story{k}', p, 'medium') for k, p in enumerate(ip['story'])]
+    tasks += [(f'desk{k}', p, 'medium') for k, p in enumerate(ip['desk'])]
+    with ThreadPoolExecutor(4) as ex:
+        res = list(ex.map(lambda t: openai_image(t[1], os.path.join(A, t[0] + '.png'), t[2]), tasks))
+    out = {'story': [], 'desk': []}
+    for (name, _, _), path in zip(tasks, res):
+        if name in ('bust', 'thumb'):
+            out[name] = path
+        else:
+            out[name.rstrip('0123456789')].append(path)
+    return out
+
+
 # ---------- hoofdprogramma ----------
 def main():
     job = json.load(open(os.environ['JOB_FILE'])) if os.environ.get('JOB_FILE') else json.loads(os.environ['JOB'])
+    job = normalize(job)
     row = job['row']; fmt = job.get('format', 'Deep')
     sys.path.insert(0, ROOT)
     import voice
@@ -325,11 +417,16 @@ def main():
     # downloads
     A = os.path.join(WORK, 'assets'); os.makedirs(A, exist_ok=True)
     beat = drive_download(job['beat']['id'], os.path.join(A, 'beat' + os.path.splitext(job['beat'].get('name', 'b.mp3'))[1]))
-    imgs = job['images']
-    bust = drive_download(imgs['bust'], os.path.join(A, 'bust.png'))
-    thumbsrc = drive_download(imgs.get('thumb', imgs['bust']), os.path.join(A, 'thumb.png'))
-    story = [drive_download(i, os.path.join(A, f'story{k}.png')) for k, i in enumerate(imgs.get('story', []))]
-    desk = [drive_download(i, os.path.join(A, f'desk{k}.png')) for k, i in enumerate(imgs.get('desk', []))]
+    if job.get('image_prompts'):
+        im = make_images(job, A)
+        bust, thumbsrc, story, desk = im['bust'], im['thumb'], im['story'], im['desk']
+    else:
+        imgs = job['images']
+        bust = drive_download(imgs['bust'], os.path.join(A, 'bust.png'))
+        thumbsrc = drive_download(imgs.get('thumb', imgs['bust']), os.path.join(A, 'thumb.png'))
+        story = [drive_download(i, os.path.join(A, f'story{k}.png')) for k, i in enumerate(imgs.get('story', []))]
+        desk = [drive_download(i, os.path.join(A, f'desk{k}.png')) for k, i in enumerate(imgs.get('desk', []))]
+    log('beelden klaar', len(story), 'verhaal', len(desk), 'bureau')
     hook_v = drive_download(job['hook']['video'], os.path.join(A, 'hook_v.mp4'))
     hook_a = drive_download(job['hook']['audio'], os.path.join(A, 'hook_a.wav')) if job['hook'].get('audio') else None
 
